@@ -104,3 +104,58 @@ class Agent:
         valid_actions = self.environ.get_valid_actions(s)
         action_values = [self.q(state=s, action=a, weight=self.w) for a in valid_actions]
         return valid_actions[self.environ.rng.choice(len(action_values), p=softmax(action_values))]
+
+    def beam_search_policy(self, state: int, depth: int = 20, k: int = 10) -> int:
+        '''
+        Beam search policy from Li & Peng 2021.
+        Explores a game tree of `depth` levels, keeping the k highest-scoring
+        boards at each level according to TwntyFrtyEight.heuristic_score.
+        Returns the first action that leads to the best-scoring terminal beam.
+
+        Parameters
+        ----------
+        state : int   Current encoded game state.
+        depth : int   How many plies to look ahead (default 20).
+        k     : int   Beam width — max states kept per level (default 10).
+        '''
+        board = TwntyFrtyEight.state_to_board(state)
+
+        # Helper: valid actions directly from a board (avoids expensive board_to_state)
+        def valid_actions_from_board(b):
+            return [a for a in range(4) if np.any(TwntyFrtyEight.move(b, a)[0] != b)]
+
+        root_actions = valid_actions_from_board(board)
+        if not root_actions:
+            return 0
+
+        # Initialize beam: list of (board, first_action_taken)
+        beam = []
+        for action in root_actions:
+            next_board, _ = TwntyFrtyEight.move(board, action)
+            next_board = TwntyFrtyEight.add_two(next_board)
+            beam.append((next_board, action))
+
+        # Expand beam depth-1 more times (first expansion already done above)
+        for _ in range(depth - 1):
+            candidates = []
+            for b, first_action in beam:
+                status = TwntyFrtyEight.get_board_status(b)
+                if status in ('win', 'lose'):
+                    # Terminal node — keep as-is, don't expand
+                    candidates.append((b, first_action, TwntyFrtyEight.heuristic_score(b)))
+                    continue
+                for a in valid_actions_from_board(b):
+                    nb, _ = TwntyFrtyEight.move(b, a)
+                    nb = TwntyFrtyEight.add_two(nb)
+                    candidates.append((nb, first_action, TwntyFrtyEight.heuristic_score(nb)))
+
+            if not candidates:
+                break
+
+            # Keep top-k by heuristic score
+            candidates.sort(key=lambda x: x[2], reverse=True)
+            beam = [(b, fa) for b, fa, _ in candidates[:k]]
+
+        # Return the first action of the best-scoring entry in the final beam
+        best_board, best_action = max(beam, key=lambda x: TwntyFrtyEight.heuristic_score(x[0]))
+        return best_action

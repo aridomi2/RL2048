@@ -275,38 +275,57 @@ class TwntyFrtyEight(Environment):
                         smooth_scores.append(perimeter_diff(x, y))
             return np.average(smooth_scores)
 
-        def largest_blob():
-            max_tile = 1 if max(compressed_board) == 0 else max(compressed_board)
-            position = tuple(board.index(max_tile))
-            print(position)
-            shifts = [-1, 0, 1]
-            surrounding = []
-            for horizontal_shift in shifts:
-                for vertical_shift in shifts:
-                    if horizontal_shift == vertical_shift == 0:
-                        continue
-                    try:
-                        surrounding.append(board[position[1]+vertical_shift][position[0]+horizontal_shift])
-                    except:
-                        continue
-            for tile in surrounding:
-                tile = 1 if tile == 0 else tile
-            surrounding = np.sort(np.log(surrounding))
-            return np.log(max_tile) + np.sum(surrounding[:3])
-
         def max_tile():
             tile_value = np.max(compressed_board)
             tile_value = 1 if tile_value == 0 else tile_value
             return np.log2(tile_value)
 
-        X = np.array([emptiness(),
-                      points,
+        def roughness():
+            '''Standard deviation of differences between adjacent tiles (measures board jaggedness)'''
+            row_diffs = np.diff(compressed_board, axis=1).flatten()
+            col_diffs = np.diff(compressed_board, axis=0).flatten()
+            return np.std(np.concatenate([row_diffs, col_diffs]))
+
+        def monotonicity():
+            '''Length of longest monotonically non-decreasing tile sequence in any row/col direction'''
+            max_run = 1
+            for row in compressed_board:
+                for direction in [row, row[::-1]]:
+                    run = 1
+                    for j in range(1, len(direction)):
+                        if direction[j] >= direction[j - 1]:
+                            run += 1
+                        else:
+                            run = 1
+                        max_run = max(max_run, run)
+            for col in compressed_board.T:
+                for direction in [col, col[::-1]]:
+                    run = 1
+                    for i in range(1, len(direction)):
+                        if direction[i] >= direction[i - 1]:
+                            run += 1
+                        else:
+                            run = 1
+                        max_run = max(max_run, run)
+            return max_run
+
+        def std_vertical_dif():
+            '''Standard deviation of vertical (row-to-row) tile differences'''
+            return np.std(compressed_board[:-1] - compressed_board[1:])
+
+        def std_horizontal_dif():
+            '''Standard deviation of horizontal (col-to-col) tile differences'''
+            return np.std(compressed_board[:, :-1] - compressed_board[:, 1:])
+
+        X = np.array([points,
+                      emptiness(),
+                      roughness(),
+                      monotonicity(),
+                      std_vertical_dif(),
+                      std_horizontal_dif(),
                       tile_delta(),
-                      #mean(),
-                      #std(),
-                      tile_delta_max(),
-                      largest_blob(),
-                      #smoothness(),
+                      mean(),
+                      std(),
                       distance_to_corner(),
                       center_sum(),
                       perimeter_sum(),
@@ -366,10 +385,49 @@ class TwntyFrtyEight(Environment):
     def is_terminal_state(state: int):
         if state == TwntyFrtyEight.WINNING_STATE:
             return True
-        
+
         if 0 <= state < TwntyFrtyEight.WINNING_STATE:
             board = TwntyFrtyEight.state_to_board(state)
             if TwntyFrtyEight.get_board_status(board) == 'lose':
                 return True
             else:
                 return False
+
+    @staticmethod
+    def heuristic_score(board: np.ndarray) -> float:
+        '''
+        Heuristic board evaluation for beam search.
+        Combines four factors from Li & Peng 2021:
+          1. Empty tiles  (more is better)
+          2. Max tile     (higher is better)
+          3. Smoothness   (lower adjacent log-difference is better)
+          4. Monotonicity (more ordered rows/cols is better)
+        Weights tuned to balance exploration vs. greedy corner-stacking.
+        '''
+        # 1. Empty tiles
+        empty = np.count_nonzero(board == 0)
+
+        # 2. Max tile in log2 space
+        max_val = np.max(board)
+        max_score = np.log2(max_val) if max_val > 0 else 0
+
+        # 3. Smoothness: negative sum of |log2 differences| between adjacent tiles
+        with np.errstate(divide='ignore'):
+            log_board = np.where(board > 0, np.log2(board.astype(float)), 0)
+        smoothness = -np.sum(np.abs(np.diff(log_board, axis=1)))
+        smoothness -= np.sum(np.abs(np.diff(log_board, axis=0)))
+
+        # 4. Monotonicity: count adjacent pairs that are in order (row/col, both directions)
+        mono = 0
+        for row in log_board:
+            mono += max(
+                sum(row[i] >= row[i + 1] for i in range(len(row) - 1)),
+                sum(row[i] <= row[i + 1] for i in range(len(row) - 1))
+            )
+        for col in log_board.T:
+            mono += max(
+                sum(col[i] >= col[i + 1] for i in range(len(col) - 1)),
+                sum(col[i] <= col[i + 1] for i in range(len(col) - 1))
+            )
+
+        return empty * 2.7 + max_score + smoothness * 0.1 + mono
