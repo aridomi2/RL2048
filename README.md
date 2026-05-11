@@ -33,8 +33,9 @@ RL2048/
 ├── agent.py         # SARSA agent, all policies including beam_search_policy
 ├── episode.py       # Episode rollout helper
 ├── train.py         # Train SARSA → saves w_star.npy
-├── dqn.py           # DQN agent → saves dqn_weights.pth + train stats JSON
-├── benchmark.py     # Compare all methods, produce plots
+├── dqn.py           # DQN agent + all standalone visualizations
+├── 2048_DQN.ipynb   # Colab/Kaggle notebook (train, eval, compare, plot)
+├── benchmark.py     # Local comparison script for all methods
 ├── test.py          # Tkinter visualizer (SARSA)
 ├── w_star.npy       # SARSA weights (zero-initialized; overwritten by train.py)
 └── constants.py     # UI constants for the tkinter visualizer

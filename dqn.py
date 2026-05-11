@@ -303,6 +303,244 @@ class DQNAgent:
         self.target_net.eval()
         print(f'Model loaded ← {path}')
 
+    # ------------------------------------------------------------------
+    # Evaluation
+    # ------------------------------------------------------------------
+
+    def evaluate(self, n_games: int = 200, epsilon: float = 0.0) -> list[dict]:
+        '''
+        Play n_games greedily and return per-game stats.
+        Use after training to measure policy quality.
+
+        Example:
+            stats = agent.evaluate(200)
+            plot_tile_distribution(stats)
+        '''
+        results = []
+        for i in range(n_games):
+            results.append(self.play_game(epsilon=epsilon))
+            if (i + 1) % 50 == 0:
+                print(f'  evaluated {i+1}/{n_games} games')
+        return results
+
+
+# ---------------------------------------------------------------------------
+# Standalone visualizations
+# (no benchmark.py needed — all plots work from dqn.py alone)
+# ---------------------------------------------------------------------------
+
+def plot_training_curve(stats: list[dict], window: int = 100,
+                        save_path: str | None = 'dqn_training_curve.png'):
+    '''
+    Plot moves-per-game and cumulative reward over training episodes.
+
+    Parameters
+    ----------
+    stats     : list returned by agent.train()
+    window    : rolling-average window size
+    save_path : file to save to (set None to skip saving)
+
+    Notebook usage:
+        stats = agent.train(n_games=2000)
+        plot_training_curve(stats)
+    '''
+    import matplotlib.pyplot as plt
+
+    games   = [s['game']         for s in stats]
+    steps   = [s['steps']        for s in stats]
+    rewards = [s['total_reward'] for s in stats]
+    tiles   = [s['max_tile']     for s in stats]
+
+    w = min(window, len(stats))
+    kernel = np.ones(w) / w
+    sm_steps   = np.convolve(steps,   kernel, mode='valid')
+    sm_rewards = np.convolve(rewards, kernel, mode='valid')
+    x = games[w - 1:]
+
+    fig, axes = plt.subplots(3, 1, figsize=(11, 9), sharex=True)
+    fig.suptitle(f'DQN Training  ({len(stats)} episodes)', fontsize=13, fontweight='bold')
+
+    # Panel 1 — moves per episode
+    axes[0].plot(x, sm_steps, color='#4C72B0', linewidth=1.4, label=f'rolling avg ({w})')
+    axes[0].scatter(games, steps, alpha=0.08, s=4, color='#4C72B0')
+    axes[0].set_ylabel('Moves per game')
+    axes[0].legend(fontsize=8)
+    axes[0].grid(alpha=0.25)
+
+    # Panel 2 — total reward per episode
+    axes[1].plot(x, sm_rewards, color='#DD8452', linewidth=1.4, label=f'rolling avg ({w})')
+    axes[1].scatter(games, rewards, alpha=0.08, s=4, color='#DD8452')
+    axes[1].set_ylabel('Total reward')
+    axes[1].legend(fontsize=8)
+    axes[1].grid(alpha=0.25)
+
+    # Panel 3 — max tile reached per episode (scatter coloured by tile)
+    tile_vals = sorted(set(tiles))
+    cmap = plt.cm.get_cmap('viridis', len(tile_vals))
+    tile_to_idx = {t: i for i, t in enumerate(tile_vals)}
+    colors = [cmap(tile_to_idx[t]) for t in tiles]
+    axes[2].scatter(games, tiles, c=colors, s=5, alpha=0.5)
+    axes[2].set_ylabel('Max tile reached')
+    axes[2].set_xlabel('Episode')
+    axes[2].set_yscale('log', base=2)
+    axes[2].yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: str(int(v))))
+    axes[2].grid(alpha=0.25)
+
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f'Training curve saved → {save_path}')
+    plt.show()
+
+
+def plot_tile_distribution(stats: list[dict],
+                           label: str = 'DQN',
+                           save_path: str | None = 'dqn_tile_distribution.png'):
+    '''
+    Bar chart showing how often the agent reached each max-tile milestone,
+    plus a cumulative reach-rate panel.
+
+    Parameters
+    ----------
+    stats     : list of {max_tile, steps} dicts  (from agent.evaluate() or agent.train())
+    label     : legend label / title suffix
+    save_path : file to save to (set None to skip saving)
+
+    Notebook usage:
+        eval_stats = agent.evaluate(200)
+        plot_tile_distribution(eval_stats)
+    '''
+    import matplotlib.pyplot as plt
+    import matplotlib.ticker as mtick
+
+    n = len(stats)
+    milestones = [2**i for i in range(1, 12)]   # 2 … 2048
+    counts  = [sum(1 for s in stats if s['max_tile'] == t) for t in milestones]
+    cumul   = [sum(1 for s in stats if s['max_tile'] >= t) / n * 100 for t in milestones]
+    labels  = [str(t) for t in milestones]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
+    fig.suptitle(f'Tile Distribution — {label}  (n={n})', fontsize=13, fontweight='bold')
+
+    # Left: exact distribution (counts)
+    bar_color = '#4C72B0'
+    bars = ax1.bar(labels, counts, color=bar_color, alpha=0.85, edgecolor='white')
+    for bar, cnt in zip(bars, counts):
+        if cnt > 0:
+            ax1.text(bar.get_x() + bar.get_width() / 2,
+                     bar.get_height() + 0.3,
+                     str(cnt), ha='center', va='bottom', fontsize=8)
+    ax1.set_xlabel('Max tile reached')
+    ax1.set_ylabel('Number of games')
+    ax1.set_title('Exact tile reached')
+    ax1.tick_params(axis='x', rotation=45)
+
+    # Right: cumulative reach rate
+    ax2.bar(labels, cumul, color='#55A868', alpha=0.85, edgecolor='white')
+    for i, (pct, lbl) in enumerate(zip(cumul, labels)):
+        if pct > 2:
+            ax2.text(i, pct + 0.5, f'{pct:.1f}%', ha='center', va='bottom', fontsize=8)
+    ax2.set_xlabel('Reached at least this tile')
+    ax2.set_ylabel('% of games')
+    ax2.set_title('Cumulative reach rate')
+    ax2.yaxis.set_major_formatter(mtick.PercentFormatter())
+    ax2.set_ylim(0, 105)
+    ax2.tick_params(axis='x', rotation=45)
+
+    # Print summary to console too
+    print(f'\n{label} — {n} games')
+    print(f"  avg moves : {np.mean([s['steps'] for s in stats]):.1f}")
+    for t in [512, 1024, 2048]:
+        r = sum(1 for s in stats if s['max_tile'] >= t) / n * 100
+        print(f'  ≥{t:<6}   : {r:.1f}%')
+
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f'Tile distribution saved → {save_path}')
+    plt.show()
+
+
+def compare_agents(results: dict[str, list[dict]],
+                   save_path: str | None = 'comparison.png'):
+    '''
+    Side-by-side comparison of multiple agents.
+    Pass a dict mapping agent name → list of {max_tile, steps} dicts.
+
+    Notebook usage (after training DQN and running beam search):
+        from game import TwntyFrtyEight
+        from agent import Agent
+
+        dqn_stats  = dqn_agent.evaluate(100)
+
+        game   = TwntyFrtyEight()
+        sarsa  = Agent(game)
+        sarsa.w = np.load('w_star.npy')
+        sarsa_stats = [_run_one(game, sarsa.greedy_policy) for _ in range(100)]
+        beam_stats  = [_run_one(game, lambda s: sarsa.beam_search_policy(s, depth=10, k=5))
+                       for _ in range(50)]
+
+        compare_agents({'DQN': dqn_stats, 'SARSA': sarsa_stats, 'Beam': beam_stats})
+    '''
+    import matplotlib.pyplot as plt
+    import matplotlib.ticker as mtick
+
+    methods  = list(results.keys())
+    colors   = ['#4C72B0', '#DD8452', '#55A868', '#C44E52', '#8172B2'][:len(methods)]
+    milestones = [256, 512, 1024, 2048]
+    x = np.arange(len(milestones))
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
+    fig.suptitle('Agent Comparison', fontsize=13, fontweight='bold')
+
+    # Left: cumulative reach rates
+    width = 0.7 / len(methods)
+    for i, (method, stats) in enumerate(results.items()):
+        n    = len(stats)
+        pcts = [sum(1 for s in stats if s['max_tile'] >= t) / n * 100 for t in milestones]
+        offset = x + i * width - (len(methods) - 1) * width / 2
+        bars = ax1.bar(offset, pcts, width, label=method, color=colors[i], alpha=0.85)
+        for bar, pct in zip(bars, pcts):
+            if pct > 4:
+                ax1.text(bar.get_x() + bar.get_width() / 2,
+                         bar.get_height() + 0.6,
+                         f'{pct:.0f}%', ha='center', va='bottom', fontsize=7)
+    ax1.set_xticks(x)
+    ax1.set_xticklabels([str(t) for t in milestones])
+    ax1.set_xlabel('Reached at least this tile')
+    ax1.set_ylabel('% of games')
+    ax1.set_title('Cumulative reach rate')
+    ax1.yaxis.set_major_formatter(mtick.PercentFormatter())
+    ax1.set_ylim(0, 105)
+    ax1.legend(fontsize=9)
+
+    # Right: game length box plot
+    groups = [[s['steps'] for s in results[m]] for m in methods]
+    bp = ax2.boxplot(groups, labels=methods, patch_artist=True,
+                     medianprops=dict(color='black', linewidth=1.5))
+    for patch, color in zip(bp['boxes'], colors):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.75)
+    ax2.set_ylabel('Number of moves')
+    ax2.set_title('Game length distribution')
+
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f'Comparison plot saved → {save_path}')
+    plt.show()
+
+
+def _run_one(game, policy) -> dict:
+    '''Helper: run one episode with any state-based policy. Used by compare_agents example.'''
+    s = game.get_initial_state()
+    steps = 0
+    while not game.is_terminal_state(s):
+        a = policy(s)
+        s = game.transition(s, a)
+        steps += 1
+    return {'max_tile': int(game.get_state_status(s)), 'steps': steps}
+
 
 # ---------------------------------------------------------------------------
 # CLI / notebook entry point
