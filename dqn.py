@@ -539,7 +539,12 @@ def _run_one(game, policy) -> dict:
         a = policy(s)
         s = game.transition(s, a)
         steps += 1
-    return {'max_tile': int(game.get_state_status(s)), 'steps': steps}
+    # WINNING_STATE is a sentinel outside the normal state range, so state_to_board()
+    # returns None for it — handle it explicitly instead of calling get_state_status().
+    max_tile = (TwntyFrtyEight.WINNING_VALUE
+                if s == TwntyFrtyEight.WINNING_STATE
+                else int(game.get_state_status(s)))
+    return {'max_tile': max_tile, 'steps': steps}
 
 
 # ---------------------------------------------------------------------------
