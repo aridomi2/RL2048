@@ -1,9 +1,22 @@
 '''
 Deep Q-Network agent for 2048.
 
-Based on Model 1 from:
+Implements the CNN + Double DQN model from:
   Li & Peng, "Playing 2048 With Reinforcement Learning" (2021)
   https://arxiv.org/abs/2110.10374
+
+Key design choices (all from or motivated by the paper):
+  - CNN encoder: two Conv2d layers process the (16, 4, 4) one-hot board
+    spatially before the MLP head, capturing tile-adjacency patterns that
+    a flat MLP cannot see.
+  - Double DQN: online net selects actions, target net evaluates them,
+    reducing Q-value overestimation.
+  - Hard target update every N steps (instead of soft τ update) gives a
+    stable regression target during early training.
+  - Reward = raw merge score only (no max-tile bonus) — clean, stationary
+    signal aligned with the actual game objective.
+  - Gradient clipping (max norm 10) guards against exploding gradients from
+    the exponentially-scaled merge scores.
 
 Self-contained: only requires numpy, torch, and game.py from this repo.
 Both PyTorch and numpy are pre-installed on Kaggle and Google Colab —
@@ -62,22 +75,45 @@ def _valid_actions(board: np.ndarray) -> list:
 
 class DQNNet(nn.Module):
     '''
-    Model 1 from Li & Peng 2021.
-    Linear(256 → hidden) → ReLU → Dropout → Linear(hidden → 4)
-    Output: Q-value for each of the 4 actions.
+    CNN model from Li & Peng 2021.
+
+    Architecture:
+        Input : (batch, 256) — flattened (16, 4, 4) one-hot board
+        Reshape: (batch, 16, 4, 4)
+        Conv1 : Conv2d(16 → 128, 3×3, padding=1) → ReLU   # (batch, 128, 4, 4)
+        Conv2 : Conv2d(128 → 128, 3×3, padding=1) → ReLU  # (batch, 128, 4, 4)
+        Flatten: (batch, 128*4*4 = 2048)
+        FC1   : Linear(2048 → hidden) → ReLU → Dropout
+        FC2   : Linear(hidden → 4)
+        Output: Q-value for each of the 4 actions
+
+    Two conv layers let the network learn spatial patterns (corner stacking,
+    monotone rows, merging opportunities) that a flat MLP cannot represent.
+    The input is kept as a flat 256-vector so board_to_tensor() is unchanged;
+    the reshape to (16, 4, 4) happens inside forward().
     '''
-    def __init__(self, input_size: int = 256, hidden_size: int = 128,
-                 output_size: int = 4, dropout: float = 0.2):
+    def __init__(self, hidden_size: int = 256, dropout: float = 0.2):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_size, hidden_size),
+        self.conv = nn.Sequential(
+            nn.Conv2d(16, 128, kernel_size=3, padding=1),   # (16,4,4) → (128,4,4)
+            nn.ReLU(),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),  # (128,4,4) → (128,4,4)
+            nn.ReLU(),
+        )
+        conv_out = 128 * 4 * 4  # 2048
+        self.fc = nn.Sequential(
+            nn.Linear(conv_out, hidden_size),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_size, output_size),
+            nn.Linear(hidden_size, 4),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        # x: (batch, 256) — reshape to spatial (batch, 16, 4, 4) for conv layers
+        x = x.view(x.size(0), 16, 4, 4)
+        x = self.conv(x)
+        x = x.view(x.size(0), -1)  # flatten back
+        return self.fc(x)
 
 
 # ---------------------------------------------------------------------------
@@ -110,29 +146,49 @@ class DQNAgent:
     Deep Q-learning agent for 2048.
 
     Uses:
+      - CNN encoder (two Conv2d layers) for spatial board understanding
+      - Double DQN: online net selects actions, target net evaluates them
       - Experience replay (ReplayBuffer)
-      - Soft-update target network (τ = 0.01 per step)
+      - Hard target network update every `target_update_freq` optimisation steps
       - Epsilon-greedy exploration over valid actions only
-      - MSE loss:  (r + γ · max_a Q_target(s',a) - Q(s,a))²
+      - MSE loss with gradient clipping (max norm 10)
+      - Reward = raw merge score (no auxiliary bonuses)
     '''
 
     def __init__(self, lr: float = 1e-4, gamma: float = 0.99,
-                 hidden_size: int = 128, buffer_capacity: int = 10_000,
-                 dropout: float = 0.2, tau: float = 0.01):
+                 hidden_size: int = 256, buffer_capacity: int = 100_000,
+                 dropout: float = 0.2, target_update_freq: int = 1000):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.gamma = gamma
-        self.tau = tau
+        self.target_update_freq = target_update_freq
+        self._opt_steps = 0  # counts optimisation steps for hard target update
 
         self.online_net = DQNNet(hidden_size=hidden_size, dropout=dropout).to(self.device)
         self.target_net = DQNNet(hidden_size=hidden_size, dropout=dropout).to(self.device)
         self.target_net.load_state_dict(self.online_net.state_dict())
         self.target_net.eval()
 
+        # Use all available GPUs via DataParallel when more than one is present.
+        # save() / load() unwrap the module automatically so weights are portable.
+        n_gpus = torch.cuda.device_count()
+        if n_gpus > 1:
+            self.online_net = nn.DataParallel(self.online_net)
+            self.target_net = nn.DataParallel(self.target_net)
+
         self.optimizer = optim.Adam(self.online_net.parameters(), lr=lr)
         self.replay_buffer = ReplayBuffer(buffer_capacity)
 
-        print(f'DQNAgent ready | device={self.device} | '
-              f'hidden={hidden_size} | buffer={buffer_capacity}')
+        print(f'DQNAgent ready | device={self.device} | GPUs={max(n_gpus,1)} | '
+              f'hidden={hidden_size} | buffer={buffer_capacity} | '
+              f'target_update_freq={target_update_freq}')
+
+    # ------------------------------------------------------------------
+    # DataParallel helper
+    # ------------------------------------------------------------------
+
+    def _unwrap(self, net: nn.Module) -> nn.Module:
+        '''Return the underlying module, unwrapping DataParallel if needed.'''
+        return net.module if isinstance(net, nn.DataParallel) else net
 
     # ------------------------------------------------------------------
     # Action selection
@@ -158,13 +214,24 @@ class DQNAgent:
     # Optimization
     # ------------------------------------------------------------------
 
-    def _soft_update_target(self):
-        for t_p, o_p in zip(self.target_net.parameters(),
-                             self.online_net.parameters()):
-            t_p.data.copy_(self.tau * o_p.data + (1 - self.tau) * t_p.data)
+    def _hard_update_target(self):
+        '''Copy online network weights directly into target network.'''
+        self._unwrap(self.target_net).load_state_dict(
+            self._unwrap(self.online_net).state_dict()
+        )
 
     def optimize(self, batch_size: int = 128) -> float | None:
-        '''Sample one batch from replay buffer and do one gradient step.'''
+        '''
+        Sample one batch from the replay buffer and do one gradient step.
+
+        Uses Double DQN to decouple action selection from action evaluation:
+          - Online net picks the best next action: a* = argmax_a Q_online(s', a)
+          - Target net evaluates it:  Q_target(s', a*)
+        This reduces overestimation bias vs. vanilla max Q_target(s', a).
+
+        Gradient clipping (max_norm=10) prevents exploding updates from
+        large merge-score rewards late in training.
+        '''
         if len(self.replay_buffer) < batch_size:
             return None
 
@@ -180,16 +247,22 @@ class DQNAgent:
         # Q(s, a) from online network
         current_q = self.online_net(states).gather(1, actions.unsqueeze(1)).squeeze(1)
 
-        # Target: r + γ · max_a Q_target(s', a)  (0 if terminal)
+        # Double DQN target: r + γ · Q_target(s', argmax_a Q_online(s', a))
         with torch.no_grad():
-            next_q = self.target_net(next_states).max(1)[0]
-            target_q = rewards + self.gamma * next_q * (1.0 - dones)
+            next_actions = self.online_net(next_states).argmax(1, keepdim=True)
+            next_q       = self.target_net(next_states).gather(1, next_actions).squeeze(1)
+            target_q     = rewards + self.gamma * next_q * (1.0 - dones)
 
         loss = nn.functional.mse_loss(current_q, target_q)
         self.optimizer.zero_grad()
         loss.backward()
+        nn.utils.clip_grad_norm_(self.online_net.parameters(), max_norm=10.0)
         self.optimizer.step()
-        self._soft_update_target()
+
+        # Hard target update every target_update_freq optimisation steps
+        self._opt_steps += 1
+        if self._opt_steps % self.target_update_freq == 0:
+            self._hard_update_target()
 
         return loss.item()
 
@@ -199,14 +272,35 @@ class DQNAgent:
 
     def train(self, n_games: int = 1000, epsilon_start: float = 0.3,
               epsilon_end: float = 0.05, epsilon_decay: float = 0.995,
-              batch_size: int = 128, print_every: int = 100) -> list[dict]:
+              batch_size: int = 128, print_every: int = 100,
+              n_envs: int = 1) -> list[dict]:
         '''
         Train for `n_games` episodes.
 
+        Parameters
+        ----------
+        n_games        : total games to play
+        epsilon_start  : initial exploration rate
+        epsilon_end    : minimum exploration rate
+        epsilon_decay  : multiplicative decay per completed game
+        batch_size     : replay buffer sample size per optimisation step
+        print_every    : log a summary line every N games
+        n_envs         : number of parallel game environments.
+                         Set n_envs=16 (or higher) on GPU to batch forward
+                         passes and dramatically increase GPU utilisation.
+                         n_envs=1 uses the original sequential loop.
+
         Returns a list of per-game dicts with keys:
             game, max_tile, steps, total_reward
-        Useful for plotting the training curve afterwards.
         '''
+        if n_envs > 1:
+            return self._train_parallel(
+                n_games=n_games, n_envs=n_envs,
+                epsilon_start=epsilon_start, epsilon_end=epsilon_end,
+                epsilon_decay=epsilon_decay, batch_size=batch_size,
+                print_every=print_every,
+            )
+
         epsilon = epsilon_start
         all_stats = []
 
@@ -226,9 +320,8 @@ class DQNAgent:
                 status = TwntyFrtyEight.get_board_status(next_board)
                 done = status in ('win', 'lose')
 
-                # Reward: merge score + bonus when a new max tile appears
-                bonus = int(np.max(next_board)) if np.max(next_board) > np.max(board) else 0
-                reward = float(points + bonus)
+                # Reward: raw merge score only — clean, stationary signal
+                reward = float(points)
 
                 self.replay_buffer.push(
                     board_to_tensor(board),
@@ -268,6 +361,111 @@ class DQNAgent:
 
         return all_stats
 
+    def _train_parallel(self, n_games: int, n_envs: int,
+                        epsilon_start: float, epsilon_end: float,
+                        epsilon_decay: float, batch_size: int,
+                        print_every: int) -> list[dict]:
+        '''
+        Train across n_envs simultaneous game environments.
+
+        All boards are batched into a single GPU forward pass per step,
+        giving the network (n_envs × avg_steps_per_game) samples per second
+        instead of one — dramatically increasing GPU utilisation.
+
+        Called automatically by train() when n_envs > 1.
+        '''
+        epsilon  = epsilon_start
+        all_stats: list[dict] = []
+        games_done = 0
+
+        boards          = [TwntyFrtyEight.new_board(4, 4) for _ in range(n_envs)]
+        episode_rewards = [0.0] * n_envs
+        episode_steps   = [0]   * n_envs
+
+        while games_done < n_games:
+            # ── Batch forward pass ─────────────────────────────────────
+            state_batch = torch.stack(
+                [board_to_tensor(b) for b in boards]
+            ).to(self.device)                          # (n_envs, 256)
+
+            with torch.no_grad():
+                q_batch = self.online_net(state_batch).cpu().numpy()  # (n_envs, 4)
+
+            # ── Select one action per environment ──────────────────────
+            actions = []
+            for i, board in enumerate(boards):
+                valid = _valid_actions(board)
+                if not valid:
+                    actions.append(0)
+                elif random.random() < epsilon:
+                    actions.append(random.choice(valid))
+                else:
+                    masked = np.full(4, -np.inf)
+                    for a in valid:
+                        masked[a] = q_batch[i][a]
+                    actions.append(int(np.argmax(masked)))
+
+            # ── Step every environment ─────────────────────────────────
+            for i in range(n_envs):
+                if games_done >= n_games:
+                    break
+
+                board  = boards[i]
+                action = actions[i]
+                next_board, points = TwntyFrtyEight.move(board, action)
+                if np.any(next_board != board):
+                    next_board = TwntyFrtyEight.add_two(next_board)
+
+                status = TwntyFrtyEight.get_board_status(next_board)
+                done   = status in ('win', 'lose')
+
+                # Reward: raw merge score only — clean, stationary signal
+                reward = float(points)
+
+                self.replay_buffer.push(
+                    board_to_tensor(board),
+                    action,
+                    reward,
+                    board_to_tensor(next_board),
+                    done,
+                )
+
+                episode_rewards[i] += reward
+                episode_steps[i]   += 1
+                boards[i]           = next_board
+
+                if done:
+                    games_done += 1
+                    game_stats = {
+                        'game':         games_done,
+                        'max_tile':     int(np.max(next_board)),
+                        'steps':        episode_steps[i],
+                        'total_reward': episode_rewards[i],
+                    }
+                    all_stats.append(game_stats)
+
+                    if games_done % print_every == 0:
+                        recent     = all_stats[-print_every:]
+                        avg_steps  = np.mean([s['steps'] for s in recent])
+                        win_rate   = sum(1 for s in recent if s['max_tile'] >= 2048) / print_every
+                        reach_1024 = sum(1 for s in recent if s['max_tile'] >= 1024) / print_every
+                        print(f'Game {games_done:>6}/{n_games} | '
+                              f'avg_steps={avg_steps:>7.1f} | '
+                              f'2048_rate={win_rate:>5.1%} | '
+                              f'1024_rate={reach_1024:>5.1%} | '
+                              f'ε={epsilon:.3f}')
+
+                    # Reset this environment
+                    boards[i]          = TwntyFrtyEight.new_board(4, 4)
+                    episode_rewards[i] = 0.0
+                    episode_steps[i]   = 0
+                    epsilon = max(epsilon_end, epsilon * epsilon_decay)
+
+            # One optimisation step per parallel round
+            self.optimize(batch_size)
+
+        return all_stats
+
     # ------------------------------------------------------------------
     # Inference
     # ------------------------------------------------------------------
@@ -293,14 +491,15 @@ class DQNAgent:
     # ------------------------------------------------------------------
 
     def save(self, path: str = 'dqn_weights.pth'):
-        torch.save(self.online_net.state_dict(), path)
+        # Unwrap DataParallel so weights are portable across machines / single-GPU
+        torch.save(self._unwrap(self.online_net).state_dict(), path)
         print(f'Model saved → {path}')
 
     def load(self, path: str = 'dqn_weights.pth'):
         state_dict = torch.load(path, map_location=self.device)
-        self.online_net.load_state_dict(state_dict)
-        self.target_net.load_state_dict(state_dict)
-        self.target_net.eval()
+        self._unwrap(self.online_net).load_state_dict(state_dict)
+        self._unwrap(self.target_net).load_state_dict(state_dict)
+        self._unwrap(self.target_net).eval()
         print(f'Model loaded ← {path}')
 
     # ------------------------------------------------------------------
@@ -464,65 +663,123 @@ def plot_tile_distribution(stats: list[dict],
 def compare_agents(results: dict[str, list[dict]],
                    save_path: str | None = 'comparison.png'):
     '''
-    Side-by-side comparison of multiple agents.
+    Four-panel comparison of multiple agents (2 × 2 grid).
+
+    Panels:
+      1 (top-left)  Cumulative reach rate   — % of games reaching ≥ each milestone
+      2 (top-right) Exact tile distribution — % of games whose max tile = each value
+      3 (bot-left)  Game length box plot    — distribution of moves per game
+      4 (bot-right) Mean moves per agent    — bar chart of average game length ± std
+
     Pass a dict mapping agent name → list of {max_tile, steps} dicts.
 
-    Notebook usage (after training DQN and running beam search):
-        from game import TwntyFrtyEight
-        from agent import Agent
-
-        dqn_stats  = dqn_agent.evaluate(100)
-
-        game   = TwntyFrtyEight()
-        sarsa  = Agent(game)
-        sarsa.w = np.load('w_star.npy')
-        sarsa_stats = [_run_one(game, sarsa.greedy_policy) for _ in range(100)]
-        beam_stats  = [_run_one(game, lambda s: sarsa.beam_search_policy(s, depth=10, k=5))
-                       for _ in range(50)]
-
-        compare_agents({'DQN': dqn_stats, 'SARSA': sarsa_stats, 'Beam': beam_stats})
+    Notebook usage:
+        compare_agents({'DQN': eval_stats, 'SARSA': sarsa_stats, 'Beam': beam_stats})
     '''
     import matplotlib.pyplot as plt
     import matplotlib.ticker as mtick
 
-    methods  = list(results.keys())
-    colors   = ['#4C72B0', '#DD8452', '#55A868', '#C44E52', '#8172B2'][:len(methods)]
-    milestones = [256, 512, 1024, 2048]
-    x = np.arange(len(milestones))
+    methods    = list(results.keys())
+    n_methods  = len(methods)
+    colors     = ['#4C72B0', '#DD8452', '#55A868', '#C44E52', '#8172B2'][:n_methods]
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
-    fig.suptitle('Agent Comparison', fontsize=13, fontweight='bold')
+    cum_milestones  = [256, 512, 1024, 2048]
+    exact_tiles     = [32, 64, 128, 256, 512, 1024, 2048]
+    bar_width       = 0.7 / n_methods
 
-    # Left: cumulative reach rates
-    width = 0.7 / len(methods)
+    fig, axes = plt.subplots(2, 2, figsize=(16, 11))
+    fig.suptitle('Agent Comparison', fontsize=14, fontweight='bold')
+    ax1, ax2, ax3, ax4 = axes[0, 0], axes[0, 1], axes[1, 0], axes[1, 1]
+
+    # ── Panel 1: Cumulative reach rate ────────────────────────────────────────
+    x1 = np.arange(len(cum_milestones))
     for i, (method, stats) in enumerate(results.items()):
         n    = len(stats)
-        pcts = [sum(1 for s in stats if s['max_tile'] >= t) / n * 100 for t in milestones]
-        offset = x + i * width - (len(methods) - 1) * width / 2
-        bars = ax1.bar(offset, pcts, width, label=method, color=colors[i], alpha=0.85)
+        pcts = [sum(1 for s in stats if s['max_tile'] >= t) / n * 100
+                for t in cum_milestones]
+        offset = x1 + i * bar_width - (n_methods - 1) * bar_width / 2
+        bars = ax1.bar(offset, pcts, bar_width, label=method,
+                       color=colors[i], alpha=0.85)
         for bar, pct in zip(bars, pcts):
             if pct > 4:
                 ax1.text(bar.get_x() + bar.get_width() / 2,
-                         bar.get_height() + 0.6,
+                         bar.get_height() + 0.7,
                          f'{pct:.0f}%', ha='center', va='bottom', fontsize=7)
-    ax1.set_xticks(x)
-    ax1.set_xticklabels([str(t) for t in milestones])
+    ax1.set_xticks(x1)
+    ax1.set_xticklabels([str(t) for t in cum_milestones])
     ax1.set_xlabel('Reached at least this tile')
     ax1.set_ylabel('% of games')
     ax1.set_title('Cumulative reach rate')
     ax1.yaxis.set_major_formatter(mtick.PercentFormatter())
-    ax1.set_ylim(0, 105)
+    ax1.set_ylim(0, 108)
     ax1.legend(fontsize=9)
+    ax1.grid(axis='y', alpha=0.25)
 
-    # Right: game length box plot
+    # ── Panel 2: Exact tile distribution ─────────────────────────────────────
+    x2 = np.arange(len(exact_tiles))
+    for i, (method, stats) in enumerate(results.items()):
+        n    = len(stats)
+        pcts = [sum(1 for s in stats if s['max_tile'] == t) / n * 100
+                for t in exact_tiles]
+        offset = x2 + i * bar_width - (n_methods - 1) * bar_width / 2
+        bars = ax2.bar(offset, pcts, bar_width, label=method,
+                       color=colors[i], alpha=0.85)
+        for bar, pct in zip(bars, pcts):
+            if pct > 3:
+                ax2.text(bar.get_x() + bar.get_width() / 2,
+                         bar.get_height() + 0.5,
+                         f'{pct:.0f}%', ha='center', va='bottom', fontsize=7)
+    ax2.set_xticks(x2)
+    ax2.set_xticklabels([str(t) for t in exact_tiles])
+    ax2.set_xlabel('Max tile reached (exact)')
+    ax2.set_ylabel('% of games')
+    ax2.set_title('Exact tile distribution')
+    ax2.yaxis.set_major_formatter(mtick.PercentFormatter())
+    ax2.set_ylim(0, 108)
+    ax2.legend(fontsize=9)
+    ax2.grid(axis='y', alpha=0.25)
+
+    # ── Panel 3: Game length box plot ─────────────────────────────────────────
     groups = [[s['steps'] for s in results[m]] for m in methods]
-    bp = ax2.boxplot(groups, labels=methods, patch_artist=True,
+    bp = ax3.boxplot(groups, labels=methods, patch_artist=True,
                      medianprops=dict(color='black', linewidth=1.5))
     for patch, color in zip(bp['boxes'], colors):
         patch.set_facecolor(color)
         patch.set_alpha(0.75)
-    ax2.set_ylabel('Number of moves')
-    ax2.set_title('Game length distribution')
+    ax3.set_ylabel('Number of moves')
+    ax3.set_title('Game length distribution')
+    ax3.grid(axis='y', alpha=0.25)
+
+    # ── Panel 4: Mean moves per agent (bar + error bar) ───────────────────────
+    means = [np.mean([s['steps'] for s in results[m]]) for m in methods]
+    stds  = [np.std( [s['steps'] for s in results[m]]) for m in methods]
+    x4    = np.arange(n_methods)
+    bars4 = ax4.bar(x4, means, color=colors, alpha=0.85,
+                    yerr=stds, capsize=5,
+                    error_kw=dict(elinewidth=1.2, ecolor='#333333'))
+    for bar, mean, std in zip(bars4, means, stds):
+        ax4.text(bar.get_x() + bar.get_width() / 2,
+                 bar.get_height() + std + max(means) * 0.01,
+                 f'{mean:.0f}', ha='center', va='bottom', fontsize=9,
+                 fontweight='bold')
+    ax4.set_xticks(x4)
+    ax4.set_xticklabels(methods)
+    ax4.set_ylabel('Average moves per game')
+    ax4.set_title('Mean game length  (± 1 std)')
+    ax4.grid(axis='y', alpha=0.25)
+
+    # ── Console summary ───────────────────────────────────────────────────────
+    header = f"{'Method':<18} {'n':>5} {'Avg steps':>10} {'≥2048':>8} {'≥1024':>8} {'≥512':>8}"
+    print('\n' + header)
+    print('─' * len(header))
+    for method, stats in results.items():
+        n   = len(stats)
+        avg = np.mean([s['steps'] for s in stats])
+        r2k = sum(1 for s in stats if s['max_tile'] >= 2048) / n * 100
+        r1k = sum(1 for s in stats if s['max_tile'] >= 1024) / n * 100
+        r5  = sum(1 for s in stats if s['max_tile'] >=  512) / n * 100
+        print(f'{method:<18} {n:>5} {avg:>10.1f} {r2k:>7.1f}% {r1k:>7.1f}% {r5:>7.1f}%')
+    print()
 
     plt.tight_layout()
     if save_path:
@@ -555,21 +812,26 @@ if __name__ == '__main__':
     import json, argparse
 
     parser = argparse.ArgumentParser(description='Train DQN agent for 2048')
-    parser.add_argument('--games',         type=int,   default=2000)
-    parser.add_argument('--hidden',        type=int,   default=128)
-    parser.add_argument('--lr',            type=float, default=1e-4)
-    parser.add_argument('--epsilon-start', type=float, default=0.3)
-    parser.add_argument('--epsilon-end',   type=float, default=0.05)
-    parser.add_argument('--epsilon-decay', type=float, default=0.995)
-    parser.add_argument('--batch',         type=int,   default=128)
-    parser.add_argument('--buffer',        type=int,   default=10_000)
-    parser.add_argument('--print-every',   type=int,   default=100)
-    parser.add_argument('--save',          type=str,   default='dqn_weights.pth')
-    parser.add_argument('--load',          type=str,   default=None,
+    parser.add_argument('--games',               type=int,   default=15_000)
+    parser.add_argument('--hidden',              type=int,   default=256)
+    parser.add_argument('--lr',                  type=float, default=1e-4)
+    parser.add_argument('--epsilon-start',       type=float, default=0.3)
+    parser.add_argument('--epsilon-end',         type=float, default=0.05)
+    parser.add_argument('--epsilon-decay',       type=float, default=0.9998)
+    parser.add_argument('--batch',               type=int,   default=512)
+    parser.add_argument('--buffer',              type=int,   default=100_000)
+    parser.add_argument('--target-update-freq',  type=int,   default=1000)
+    parser.add_argument('--n-envs',              type=int,   default=16,
+                        help='Parallel environments for GPU training (default 16)')
+    parser.add_argument('--print-every',         type=int,   default=100)
+    parser.add_argument('--save',                type=str,   default='dqn_weights.pth')
+    parser.add_argument('--load',                type=str,   default=None,
                         help='Path to existing weights to resume from')
     args = parser.parse_args()
 
-    agent = DQNAgent(lr=args.lr, hidden_size=args.hidden, buffer_capacity=args.buffer)
+    agent = DQNAgent(lr=args.lr, hidden_size=args.hidden,
+                     buffer_capacity=args.buffer,
+                     target_update_freq=args.target_update_freq)
 
     if args.load:
         agent.load(args.load)
@@ -581,6 +843,7 @@ if __name__ == '__main__':
         epsilon_decay = args.epsilon_decay,
         batch_size    = args.batch,
         print_every   = args.print_every,
+        n_envs        = args.n_envs,
     )
 
     agent.save(args.save)
