@@ -209,6 +209,7 @@ action = dqn_agent.select_action(game_grid.board, epsilon=0.0)
 
 ## References
 
-- Li & Peng, [Playing 2048 With Reinforcement Learning](https://arxiv.org/abs/2110.10374), NeurIPS 2021
-- Sutton & Barto, *Reinforcement Learning: An Introduction*, 2nd ed.
-- Szubert & Jaskowski, [Temporal Difference Learning of N-Tuple Networks for 2048](http://www.cs.put.poznan.pl/wjaskowski/pub/papers/Szubert2014_2048.pdf), IEEE 2014
+- Li, S., & Peng, V. (2021). Playing 2048 with reinforcement learning. arXiv. https://arxiv.org/abs/2110.10374
+- Curtis, N., Lam, S., & Moore, K. (2020). What’s in a game: Solving 2048 with reinforcement learning. Stanford University. https://web.stanford.edu/class/aa228/reports/2020/final41.pdf
+- Yeh, K.-H., Wu, I-C., Hsueh, C.-H., Chang, C.-C., Liang, C.-C., & Chiang, H. (2016). Multi-stage temporal difference learning for 2048-like games. arXiv. https://arxiv.org/abs/1606.07374
+- Tay, Y., & Goh, E. (n.d.). 2048-python [Computer software]. GitHub. https://github.com/yangshun/2048-python
